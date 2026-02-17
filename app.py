@@ -1,7 +1,20 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import streamlit as st
+
+# =========================================================
+# Streamlit Setup
+# =========================================================
+st.set_page_config(layout="wide", page_title="PID Tuning Simulator")
+
+# =========================================================
+# Time helper (Berlin time)
+# =========================================================
+def now_berlin():
+    return datetime.now(ZoneInfo("Europe/Berlin"))
 
 # =========================================================
 # Helpers
@@ -14,7 +27,6 @@ def eu_to_pct(x_eu, lrv, urv):
     if abs(span) < 1e-12:
         span = 1.0
     return 100.0 * (x_eu - lrv) / span
-
 
 def fmt(x, nd=3):
     if x is None:
@@ -138,89 +150,6 @@ def metrics_disturbance(t_min, sp_eu, pv_eu, op_pct, t_step_min, band=0.02):
         "Min OP [%]": float(np.min(op)),
     }
 
-def suggest_pid_changes(model_type, tau, dead, after_params, m_after):
-    """
-    Gibt konkrete Vorschläge für neue Parameter basierend auf Kennzahlen.
-    after_params: dict mit Kc, Ti, Td, eq, reverse, d_filter
-    m_after: dict Kennzahlen aus metrics_servo/metrics_disturbance
-    """
-    Kc = float(after_params["Kc"])
-    Ti = float(after_params["Ti"])
-    Td = float(after_params["Td"])
-    eq = str(after_params["eq"])
-    d_filter = float(after_params["d_filter"])
-
-    rec = []
-    new = dict(Kc=Kc, Ti=Ti, Td=Td, eq=eq, d_filter=d_filter)
-
-    # ---- Regeln (Servo / SP-Step) ----
-    overshoot = m_after.get("Overshoot [%]", None)
-    rise = m_after.get("Rise time [min]", None)
-    settling = m_after.get("Settling time [min]", None)
-    sse = m_after.get("Steady-state error [EU]", None)
-
-    # 1) Stationärer Fehler
-    if sse is not None and abs(sse) > 0.02:  # 0.02 EU als pragmatische Schwelle
-        rec.append(f"- **Stationärer Fehler** ist {sse:.3f} EU → Integrator wirkt zu schwach oder OP ist begrenzt.")
-        if Ti > 1e-9:
-            new["Ti"] = max(0.7 * Ti, 0.05)  # schneller integrieren
-            rec.append(f"  → Vorschlag: **Ti kleiner**: {Ti:.3f} → **{new['Ti']:.3f} min**")
-        else:
-            rec.append("  → Vorschlag: **PI/PID verwenden** (Ti > 0 setzen), sonst bleibt Offset.")
-
-    # 2) Overshoot
-    if overshoot is not None:
-        if overshoot > 10:
-            rec.append(f"- **Overshoot** ist {overshoot:.1f}% → Regler zu aggressiv.")
-            new["Kc"] = 0.7 * Kc
-            new["Ti"] = 1.3 * Ti if Ti > 1e-9 else Ti
-            rec.append(f"  → Vorschlag: **Kc reduzieren**: {Kc:.4f} → **{new['Kc']:.4f}**")
-            if Ti > 1e-9:
-                rec.append(f"  → Vorschlag: **Ti erhöhen**: {Ti:.3f} → **{new['Ti']:.3f} min**")
-        elif 5 < overshoot <= 10:
-            rec.append(f"- **Overshoot** ist {overshoot:.1f}% → leicht zu aggressiv.")
-            new["Kc"] = 0.85 * Kc
-            rec.append(f"  → Vorschlag: **Kc etwas reduzieren**: {Kc:.4f} → **{new['Kc']:.4f}**")
-
-    # 3) Einschwingzeit / „Schwingen“
-    if settling is not None and tau > 1e-9:
-        if settling > 8.0 * tau:
-            rec.append(f"- **Settling Time** ist {settling:.2f} min (>> 8·Tau={8*tau:.2f}) → langsam/Schwingen möglich.")
-            # wenn Overshoot auch hoch: dämpfen, sonst aggressiver machen
-            if overshoot is not None and overshoot > 5:
-                new["Kc"] = min(new["Kc"], 0.85 * Kc)
-                rec.append(f"  → Vorschlag: **Kc reduzieren**: {Kc:.4f} → **{new['Kc']:.4f}**")
-                # D hinzufügen, falls noch kein D
-                if Td < 1e-6 and model_type == "PT2":
-                    new["Td"] = 0.15 * tau
-                    rec.append(f"  → Vorschlag: **D ergänzen** (bei Schwingen): Td = **{new['Td']:.3f} min**")
-                    if eq in ("EqA", "EqD", "EqE"):
-                        new["eq"] = "EqB"  # D on PV ist meist robuster
-                        rec.append(f"  → Vorschlag: **EQ auf EqB** (D auf PV, meist robuster): {eq} → **{new['eq']}**")
-                    if d_filter <= 1e-9:
-                        new["d_filter"] = 0.1 * new["Td"]
-                        rec.append(f"  → Vorschlag: **D-Filter** ≈ 0.1·Td: **{new['d_filter']:.3f} min**")
-            else:
-                # zu träge, aber nicht overshoot-lastig
-                new["Kc"] = 1.15 * Kc
-                rec.append(f"  → Vorschlag: **Kc erhöhen** (schneller): {Kc:.4f} → **{new['Kc']:.4f}**")
-
-    # 4) Rise time sehr träge (ohne große Überschwinger)
-    if rise is not None and tau > 1e-9:
-        if rise > 3.0 * tau and (overshoot is None or overshoot < 5):
-            rec.append(f"- **Rise Time** ist {rise:.2f} min (> 3·Tau={3*tau:.2f}) und Overshoot klein → Regler eher zu träge.")
-            new["Kc"] = max(new["Kc"], 1.2 * Kc)
-            rec.append(f"  → Vorschlag: **Kc erhöhen**: {Kc:.4f} → **{new['Kc']:.4f}**")
-            if Ti > 1e-9:
-                new["Ti"] = 0.85 * Ti
-                rec.append(f"  → Vorschlag: **Ti etwas kleiner**: {Ti:.3f} → **{new['Ti']:.3f} min**")
-
-    # fallback
-    if not rec:
-        rec.append("- Kennzahlen sehen insgesamt stabil aus. Nächster Schritt wäre Feintuning über **Kc ±10%** oder Zielvorgaben (Overshoot/Settling).")
-
-    return rec, new
-
 # =========================================================
 # Deadtime (minutes)
 # =========================================================
@@ -275,7 +204,7 @@ class PT2_AspenSecondOrder_Min:
 
 # =========================================================
 # Honeywell EqA..EqE PID in MINUTES, PV% domain
-# Output is delta OP% around 0; OP0 is handled outside as bias.
+# Output is delta OP% around 0; OP0 handled outside as bias
 # =========================================================
 class HoneywellPID_Min_PVpct:
     def __init__(self, eq: str, Kc: float, Ti_min: float, Td_min: float, dt_min: float,
@@ -341,7 +270,6 @@ class HoneywellPID_Min_PVpct:
 
         self.prev_e = e
         self.prev_pv = float(pv_pct)
-
         return up + ui + ud
 
     def bumpless_init(self, sp_pct: float, pv_pct: float):
@@ -364,7 +292,7 @@ class HoneywellPID_Min_PVpct:
 
 # =========================================================
 # IMC recommendations in PV% domain
-# Convert process gain EU/%OP -> %PV/%OP via PV span
+# gain EU/%OP -> %PV/%OP via PV span
 # =========================================================
 def imc_lambda(tau, dead, mode):
     if mode == "conservative":
@@ -455,26 +383,23 @@ def simulate_case(
     return t, sp, pv, op
 
 # =========================================================
-# Plot (dual axis, OP green, PV thicker)
+# Plot (dual axis)
 # =========================================================
-def make_plot(t, sp, pv, op, title, op_min, op_max):
+def plot_trends(t, sp, pv, op, title, op_min, op_max):
     fig, ax = plt.subplots(figsize=(13.5, 6.2), dpi=170)
 
-    # SP/PV (EU)
     ax.step(t, sp, where="post", label="SP [EU]", linewidth=2.0)
-    ax.plot(t, pv, label="PV [EU]", linewidth=3.0)  # PV thicker
+    ax.plot(t, pv, label="PV [EU]", linewidth=3.0)
     ax.set_xlabel("t [min]")
     ax.set_ylabel("PV / SP [EU]")
     ax.grid(True, alpha=0.3)
     ax.set_title(title)
 
-    # Auto-zoom EU
     y_min = float(min(np.min(sp), np.min(pv)))
     y_max = float(max(np.max(sp), np.max(pv)))
     pad = max(0.5, 0.08 * (y_max - y_min + 1e-9))
     ax.set_ylim(y_min - pad, y_max + pad)
 
-    # OP (%), right axis, auto-scale and green
     ax2 = ax.twinx()
     ax2.plot(t, op, label="OP [%]", linewidth=2.0, color="green")
     ax2.set_ylabel("OP [%]")
@@ -490,7 +415,6 @@ def make_plot(t, sp, pv, op, title, op_min, op_max):
         hi = min(float(op_max), mid + 1.5)
     ax2.set_ylim(lo, hi)
 
-    # legend
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc="center right")
@@ -500,7 +424,6 @@ def make_plot(t, sp, pv, op, title, op_min, op_max):
 # =========================================================
 # Streamlit App
 # =========================================================
-st.set_page_config(layout="wide")
 st.title("PID Tuning Simulator (Streamlit)")
 
 # --- session defaults ---
@@ -508,48 +431,139 @@ def ss_init(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
+# PID sets
 ss_init("before", dict(eq="EqB", reverse=False, Kc=0.5, Ti=12.0, Td=0.0, d_filter=0.0))
 ss_init("after",  dict(eq="EqB", reverse=False, Kc=0.5, Ti=12.0, Td=0.0, d_filter=0.0))
 ss_init("imc_last", "")
 
+# Cases (full snapshots)
+ss_init("cases", [])
+ss_init("case_name", f"Case {now_berlin().strftime('%Y-%m-%d %H:%M:%S')}")
+ss_init("case_comment", "")
+
+# last sim persistence
+ss_init("last_sim", None)
+ss_init("last_metrics", None)
+
+# =========================================================
+# Case snapshot / restore
+# =========================================================
+def snapshot_case() -> dict:
+    """Snapshot ALL settings + PID before/after into one dict."""
+    return {
+        "name": (st.session_state.get("case_name","") or "").strip() or f"Case {now_berlin().strftime('%Y-%m-%d %H:%M:%S')}",
+        "comment": (st.session_state.get("case_comment","") or "").strip(),
+        "ts": now_berlin().strftime("%Y-%m-%d %H:%M:%S"),
+        "data": {
+            # Prozess / ranges / work / test / sim
+            "proc_model_type": st.session_state.get("proc_model_type"),
+            "proc_gain": st.session_state.get("proc_gain"),
+            "proc_tau": st.session_state.get("proc_tau"),
+            "proc_dead": st.session_state.get("proc_dead"),
+            "proc_damp": st.session_state.get("proc_damp"),
+
+            "rng_pv_lrv": st.session_state.get("rng_pv_lrv"),
+            "rng_pv_urv": st.session_state.get("rng_pv_urv"),
+            "rng_op_min": st.session_state.get("rng_op_min"),
+            "rng_op_max": st.session_state.get("rng_op_max"),
+
+            "wrk_sp0": st.session_state.get("wrk_sp0"),
+            "wrk_op0": st.session_state.get("wrk_op0"),
+            "wrk_op0_auto": st.session_state.get("wrk_op0_auto"),
+
+            "tst_mode": st.session_state.get("tst_mode"),
+            "tst_sp_step": st.session_state.get("tst_sp_step"),
+            "tst_op_step": st.session_state.get("tst_op_step"),
+            "tst_t_step": st.session_state.get("tst_t_step"),
+
+            "sim_dt": st.session_state.get("sim_dt"),
+            "sim_t_end": st.session_state.get("sim_t_end"),
+
+            # PID widgets
+            "before_eq": st.session_state.get("before_eq"),
+            "before_reverse": st.session_state.get("before_reverse"),
+            "before_Kc": st.session_state.get("before_Kc"),
+            "before_Ti": st.session_state.get("before_Ti"),
+            "before_Td": st.session_state.get("before_Td"),
+            "before_df": st.session_state.get("before_df"),
+
+            "after_eq": st.session_state.get("after_eq"),
+            "after_reverse": st.session_state.get("after_reverse"),
+            "after_Kc": st.session_state.get("after_Kc"),
+            "after_Ti": st.session_state.get("after_Ti"),
+            "after_Td": st.session_state.get("after_Td"),
+            "after_df": st.session_state.get("after_df"),
+        }
+    }
+
+def restore_case(case: dict):
+    """Restore snapshot into session_state and rerun."""
+    data = (case or {}).get("data", {})
+    # write all known keys
+    for k, v in data.items():
+        st.session_state[k] = v
+
+    # Update dicts used elsewhere (optional, keeps consistency)
+    st.session_state.before = dict(
+        eq=st.session_state.get("before_eq", "EqB"),
+        reverse=bool(st.session_state.get("before_reverse", False)),
+        Kc=float(st.session_state.get("before_Kc", 0.5)),
+        Ti=float(st.session_state.get("before_Ti", 12.0)),
+        Td=float(st.session_state.get("before_Td", 0.0)),
+        d_filter=float(st.session_state.get("before_df", 0.0)),
+    )
+    st.session_state.after = dict(
+        eq=st.session_state.get("after_eq", "EqB"),
+        reverse=bool(st.session_state.get("after_reverse", False)),
+        Kc=float(st.session_state.get("after_Kc", 0.5)),
+        Ti=float(st.session_state.get("after_Ti", 12.0)),
+        Td=float(st.session_state.get("after_Td", 0.0)),
+        d_filter=float(st.session_state.get("after_df", 0.0)),
+    )
+    st.rerun()
+
+# =========================================================
+# Sidebar: use explicit keys so restore works reliably
+# =========================================================
 with st.sidebar:
     st.header("Prozess (dmcplus)")
-    model_type = st.selectbox("Modell", ["PT1", "PT2"], index=1)
-    gain = st.number_input("Gain (EU/%OP)", value=1.954, format="%.6f")
-    tau  = st.number_input("Tau (min)", value=6.0, format="%.6f")
-    dead = st.number_input("Deadtime (min)", value=1.0, format="%.6f")
-    damp = st.number_input("Damp ζ (nur PT2)", value=1.0, format="%.6f", disabled=(model_type != "PT2"))
+    model_type = st.selectbox("Modell", ["PT1", "PT2"], index=1, key="proc_model_type")
+    gain = st.number_input("Gain (EU/%OP)", value=1.954, format="%.6f", key="proc_gain")
+    tau  = st.number_input("Tau (min)", value=6.0, format="%.6f", key="proc_tau")
+    dead = st.number_input("Deadtime (min)", value=1.0, format="%.6f", key="proc_dead")
+    damp = st.number_input("Damp ζ (nur PT2)", value=1.0, format="%.6f",
+                           disabled=(st.session_state.proc_model_type != "PT2"), key="proc_damp")
 
     st.header("Ranges (DCS)")
-    pv_lrv = st.number_input("PV LRV (EU)", value=0.0, format="%.6f")
-    pv_urv = st.number_input("PV URV (EU)", value=200.0, format="%.6f")
-    op_min = st.number_input("OP Min (%)", value=0.0, format="%.3f")
-    op_max = st.number_input("OP Max (%)", value=100.0, format="%.3f")
+    pv_lrv = st.number_input("PV LRV (EU)", value=0.0, format="%.6f", key="rng_pv_lrv")
+    pv_urv = st.number_input("PV URV (EU)", value=200.0, format="%.6f", key="rng_pv_urv")
+    op_min = st.number_input("OP Min (%)", value=0.0, format="%.3f", key="rng_op_min")
+    op_max = st.number_input("OP Max (%)", value=100.0, format="%.3f", key="rng_op_max")
 
     st.header("Arbeitspunkt")
-    sp0 = st.number_input("SP0 (EU)", value=102.0, format="%.6f")
-    op0 = st.number_input("OP0 (%)", value=52.0, format="%.6f")
-    op0_auto = st.checkbox("OP0 aus SP0/Gain schätzen", value=True)
+    sp0 = st.number_input("SP0 (EU)", value=102.0, format="%.6f", key="wrk_sp0")
+    op0 = st.number_input("OP0 (%)", value=52.0, format="%.6f", key="wrk_op0")
+    op0_auto = st.checkbox("OP0 aus SP0/Gain schätzen", value=True, key="wrk_op0_auto")
 
     st.header("Test")
-    test_mode = st.selectbox("Modus", ["SP (Servo)", "OP (Disturbance)"], index=0)
+    test_mode = st.selectbox("Modus", ["SP (Servo)", "OP (Disturbance)"], index=0, key="tst_mode")
     if test_mode.startswith("SP"):
-        sp_step = st.number_input("SP Step (EU)", value=1.0, format="%.6f")
-        op_step = 0.0
+        sp_step = st.number_input("SP Step (EU)", value=1.0, format="%.6f", key="tst_sp_step")
+        # store 0 for op_step
+        st.session_state.tst_op_step = 0.0
     else:
-        op_step = st.number_input("OP Step (%)", value=1.0, format="%.6f")
-        sp_step = 0.0
-    t_step = st.number_input("t_step (min)", value=1.0, format="%.6f")
+        op_step = st.number_input("OP Step (%)", value=1.0, format="%.6f", key="tst_op_step")
+        st.session_state.tst_sp_step = 0.0
+    t_step = st.number_input("t_step (min)", value=1.0, format="%.6f", key="tst_t_step")
 
     st.header("Simulation")
-    dt = st.number_input("dt (min)", value=0.01, format="%.6f")
-    t_end = st.number_input("t_end (min)", value=30.0, format="%.3f")
+    dt = st.number_input("dt (min)", value=0.01, format="%.6f", key="sim_dt")
+    t_end = st.number_input("t_end (min)", value=30.0, format="%.3f", key="sim_t_end")
 
     st.divider()
-
     st.subheader("IMC → Nachher")
-    imc_mode = st.selectbox("Aggressivität", ["conservative", "normal", "aggressive"], index=1)
-    imc_ctrl = st.selectbox("PI / PID", ["PI", "PID"], index=0)
+    imc_mode = st.selectbox("Aggressivität", ["conservative", "normal", "aggressive"], index=1, key="imc_mode")
+    imc_ctrl = st.selectbox("PI / PID", ["PI", "PID"], index=0, key="imc_ctrl")
 
     col_imc1, col_imc2 = st.columns(2)
     with col_imc1:
@@ -557,95 +571,182 @@ with st.sidebar:
     with col_imc2:
         do_sim = st.button("Simulieren", type="primary")
 
-    if do_imc:
-        span = float(pv_urv - pv_lrv)
-        Kc_imc, Ti_imc, Td_imc, lam = imc_tune(
-            model_type=model_type,
-            gain_eu_per_op=float(gain),
-            tau=float(tau),
-            dead=float(dead),
-            pv_span_eu=float(span),
-            mode=imc_mode,
-            controller_type=imc_ctrl
-        )
-        st.session_state.after["Kc"] = float(Kc_imc)
-        st.session_state.after["Ti"] = float(Ti_imc)
-        st.session_state.after["Td"] = float(Td_imc)
-        st.session_state.imc_last = f"IMC({imc_mode},{imc_ctrl}): λ={lam:.3f} min | Kc={Kc_imc:.4f} | Ti={Ti_imc:.4f} | Td={Td_imc:.4f}"
+    st.divider()
+    st.subheader("Cases (alle Einstellungen)")
+    st.text_input("Case Name", key="case_name")
+    st.text_area("Case Kommentar", key="case_comment", height=80)
 
-# --- main: PID panels + plots ---
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        if st.button("Case speichern"):
+            st.session_state.cases.append(snapshot_case())
+            # kein grüner Erfolgstext
+    with col_c2:
+        if st.button("Alle Cases löschen"):
+            st.session_state.cases.clear()
+            st.rerun()
+
+    if st.session_state.cases:
+        st.caption("Gespeicherte Cases")
+        for i, c in enumerate(st.session_state.cases):
+            head = f"{c.get('name','(ohne Name)')} — {c.get('ts','')}"
+            with st.expander(head, expanded=False):
+                if c.get("comment"):
+                    st.caption(c["comment"])
+                a, b = st.columns(2)
+                with a:
+                    if st.button("Laden", key=f"case_load_{i}"):
+                        restore_case(c)
+                with b:
+                    if st.button("Löschen", key=f"case_del_{i}"):
+                        st.session_state.cases.pop(i)
+                        st.rerun()
+
+# =========================================================
+# PID panels (with keys so restore works)
+# =========================================================
+# Initialize PID widget keys once from dicts
+if "before_eq" not in st.session_state:
+    st.session_state.before_eq = st.session_state.before["eq"]
+    st.session_state.before_reverse = st.session_state.before["reverse"]
+    st.session_state.before_Kc = st.session_state.before["Kc"]
+    st.session_state.before_Ti = st.session_state.before["Ti"]
+    st.session_state.before_Td = st.session_state.before["Td"]
+    st.session_state.before_df = st.session_state.before["d_filter"]
+
+if "after_eq" not in st.session_state:
+    st.session_state.after_eq = st.session_state.after["eq"]
+    st.session_state.after_reverse = st.session_state.after["reverse"]
+    st.session_state.after_Kc = st.session_state.after["Kc"]
+    st.session_state.after_Ti = st.session_state.after["Ti"]
+    st.session_state.after_Td = st.session_state.after["Td"]
+    st.session_state.after_df = st.session_state.after["d_filter"]
+
 top = st.container()
 with top:
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         st.subheader("PID vorher")
-        st.session_state.before["eq"] = st.selectbox("EQ (vorher)", ["EqA","EqB","EqC","EqD","EqE"],
-                                                     index=["EqA","EqB","EqC","EqD","EqE"].index(st.session_state.before["eq"]))
-        st.session_state.before["reverse"] = st.checkbox("Reverse (vorher)", value=st.session_state.before["reverse"])
-        st.session_state.before["Kc"] = st.number_input("Kc (vorher)", value=float(st.session_state.before["Kc"]), format="%.6f")
-        st.session_state.before["Ti"] = st.number_input("Ti (min) (vorher)", value=float(st.session_state.before["Ti"]), format="%.6f")
-        st.session_state.before["Td"] = st.number_input("Td (min) (vorher)", value=float(st.session_state.before["Td"]), format="%.6f")
-        st.session_state.before["d_filter"] = st.number_input("D-Filter (min) (vorher)", value=float(st.session_state.before["d_filter"]), format="%.6f")
+        st.selectbox("EQ (vorher)", ["EqA","EqB","EqC","EqD","EqE"], key="before_eq")
+        st.checkbox("Reverse (vorher)", key="before_reverse")
+        st.number_input("Kc (vorher)", format="%.6f", key="before_Kc")
+        st.number_input("Ti (min) (vorher)", format="%.6f", key="before_Ti")
+        st.number_input("Td (min) (vorher)", format="%.6f", key="before_Td")
+        st.number_input("D-Filter (min) (vorher)", format="%.6f", key="before_df")
 
     with c2:
         st.subheader("PID nachher")
-        st.session_state.after["eq"] = st.selectbox("EQ (nachher)", ["EqA","EqB","EqC","EqD","EqE"],
-                                                    index=["EqA","EqB","EqC","EqD","EqE"].index(st.session_state.after["eq"]))
-        st.session_state.after["reverse"] = st.checkbox("Reverse (nachher)", value=st.session_state.after["reverse"])
-        st.session_state.after["Kc"] = st.number_input("Kc (nachher)", value=float(st.session_state.after["Kc"]), format="%.6f")
-        st.session_state.after["Ti"] = st.number_input("Ti (min) (nachher)", value=float(st.session_state.after["Ti"]), format="%.6f")
-        st.session_state.after["Td"] = st.number_input("Td (min) (nachher)", value=float(st.session_state.after["Td"]), format="%.6f")
-        st.session_state.after["d_filter"] = st.number_input("D-Filter (min) (nachher)", value=float(st.session_state.after["d_filter"]), format="%.6f")
+        st.selectbox("EQ (nachher)", ["EqA","EqB","EqC","EqD","EqE"], key="after_eq")
+        st.checkbox("Reverse (nachher)", key="after_reverse")
+        st.number_input("Kc (nachher)", format="%.6f", key="after_Kc")
+        st.number_input("Ti (min) (nachher)", format="%.6f", key="after_Ti")
+        st.number_input("Td (min) (nachher)", format="%.6f", key="after_Td")
+        st.number_input("D-Filter (min) (nachher)", format="%.6f", key="after_df")
 
     with c3:
         st.subheader("Tools")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("Vorher → Nachher"):
-                st.session_state.after = dict(st.session_state.before)
+                for fld in ["eq","reverse","Kc","Ti","Td","df"]:
+                    st.session_state[f"after_{fld}"] = st.session_state[f"before_{fld}"]
+                st.rerun()
         with b2:
             if st.button("Nachher → Vorher"):
-                st.session_state.before = dict(st.session_state.after)
+                for fld in ["eq","reverse","Kc","Ti","Td","df"]:
+                    st.session_state[f"before_{fld}"] = st.session_state[f"after_{fld}"]
+                st.rerun()
 
         if st.session_state.imc_last:
             st.caption(st.session_state.imc_last)
 
-# --- compute & render ---
-if do_sim:
-    # sanity
+# Keep dicts in sync (used later)
+st.session_state.before = dict(
+    eq=st.session_state.before_eq,
+    reverse=bool(st.session_state.before_reverse),
+    Kc=float(st.session_state.before_Kc),
+    Ti=float(st.session_state.before_Ti),
+    Td=float(st.session_state.before_Td),
+    d_filter=float(st.session_state.before_df),
+)
+st.session_state.after = dict(
+    eq=st.session_state.after_eq,
+    reverse=bool(st.session_state.after_reverse),
+    Kc=float(st.session_state.after_Kc),
+    Ti=float(st.session_state.after_Ti),
+    Td=float(st.session_state.after_Td),
+    d_filter=float(st.session_state.after_df),
+)
+
+# =========================================================
+# IMC button action -> set AFTER keys
+# =========================================================
+if 'do_imc' in locals() and do_imc:
+    span = float(st.session_state.rng_pv_urv - st.session_state.rng_pv_lrv)
+    Kc_imc, Ti_imc, Td_imc, lam = imc_tune(
+        model_type=st.session_state.proc_model_type,
+        gain_eu_per_op=float(st.session_state.proc_gain),
+        tau=float(st.session_state.proc_tau),
+        dead=float(st.session_state.proc_dead),
+        pv_span_eu=float(span),
+        mode=st.session_state.imc_mode,
+        controller_type=st.session_state.imc_ctrl
+    )
+    st.session_state.after_Kc = float(Kc_imc)
+    st.session_state.after_Ti = float(Ti_imc)
+    st.session_state.after_Td = float(Td_imc)
+    st.session_state.imc_last = f"IMC({st.session_state.imc_mode},{st.session_state.imc_ctrl}): λ={lam:.3f} min | Kc={Kc_imc:.4f} | Ti={Ti_imc:.4f} | Td={Td_imc:.4f}"
+    st.rerun()
+
+# =========================================================
+# Simulation (persist results so they stay visible)
+# =========================================================
+if 'do_sim' in locals() and do_sim:
+    pv_lrv = float(st.session_state.rng_pv_lrv)
+    pv_urv = float(st.session_state.rng_pv_urv)
+    op_min = float(st.session_state.rng_op_min)
+    op_max = float(st.session_state.rng_op_max)
+    dt = float(st.session_state.sim_dt)
+    t_end = float(st.session_state.sim_t_end)
+
     if abs(pv_urv - pv_lrv) < 1e-9:
         st.error("PV URV und LRV dürfen nicht gleich sein.")
     elif dt <= 0 or t_end <= 0:
         st.error("dt und t_end müssen > 0 sein.")
     else:
         # OP0 auto option
-        if op0_auto:
-            if abs(gain) < 1e-12:
+        op0 = float(st.session_state.wrk_op0)
+        if bool(st.session_state.wrk_op0_auto):
+            if abs(float(st.session_state.proc_gain)) < 1e-12:
                 st.warning("Gain ist 0 → OP0 aus SP0/Gain nicht möglich. OP0 bleibt wie eingegeben.")
             else:
-                op0 = clamp(float(sp0) / float(gain), float(op_min), float(op_max))
+                op0 = clamp(float(st.session_state.wrk_sp0) / float(st.session_state.proc_gain), op_min, op_max)
+                st.session_state.wrk_op0 = op0
 
-        mode = "SP" if test_mode.startswith("SP") else "OP"
-        damp_used = float(damp) if model_type == "PT2" else 0.0
+        mode = "SP" if st.session_state.tst_mode.startswith("SP") else "OP"
+        damp_used = float(st.session_state.proc_damp) if st.session_state.proc_model_type == "PT2" else 0.0
+
+        sp_step = float(st.session_state.tst_sp_step)
+        op_step = float(st.session_state.tst_op_step)
 
         common = dict(
-            model_type=model_type,
-            gain_eu_per_op=float(gain),
-            tau_min=float(tau),
-            dead_min=float(dead),
+            model_type=st.session_state.proc_model_type,
+            gain_eu_per_op=float(st.session_state.proc_gain),
+            tau_min=float(st.session_state.proc_tau),
+            dead_min=float(st.session_state.proc_dead),
             damp=float(damp_used),
-            pv_lrv=float(pv_lrv),
-            pv_urv=float(pv_urv),
-            op_min=float(op_min),
-            op_max=float(op_max),
-            dt_min=float(dt),
-            t_end_min=float(t_end),
+            pv_lrv=pv_lrv,
+            pv_urv=pv_urv,
+            op_min=op_min,
+            op_max=op_max,
+            dt_min=dt,
+            t_end_min=t_end,
             test_mode=mode,
-            sp0_eu=float(sp0),
+            sp0_eu=float(st.session_state.wrk_sp0),
             sp_step_eu=float(sp_step),
             op0_pct=float(op0),
             op_step_pct=float(op_step),
-            t_step_min=float(t_step),
+            t_step_min=float(st.session_state.tst_t_step),
         )
 
         t1, sp1, pv1, op1 = simulate_case(
@@ -667,72 +768,51 @@ if do_sim:
             d_filter_min=float(st.session_state.after["d_filter"]),
         )
 
-        # Plots
-        pcol1, pcol2 = st.columns([1,1], gap="large")
-        with pcol1:
-            st.subheader("Trend: Vorher")
-            fig1 = make_plot(t1, sp1, pv1, op1, "PID Regler vorher", op_min, op_max)
-            st.pyplot(fig1, clear_figure=True, use_container_width=True)
-        with pcol2:
-            st.subheader("Trend: Nachher")
-            fig2 = make_plot(t2, sp2, pv2, op2, "PID Regler nachher", op_min, op_max)
-            st.pyplot(fig2, clear_figure=True, use_container_width=True)
-
         # Metrics
         if mode == "SP":
-            m1 = metrics_servo(t1, sp1, pv1, op1, t_step_min=float(t_step), band=0.02)
-            m2 = metrics_servo(t2, sp2, pv2, op2, t_step_min=float(t_step), band=0.02)
+            m1 = metrics_servo(t1, sp1, pv1, op1, t_step_min=float(st.session_state.tst_t_step), band=0.02)
+            m2 = metrics_servo(t2, sp2, pv2, op2, t_step_min=float(st.session_state.tst_t_step), band=0.02)
             keys = ["Overshoot [%]", "Rise time [min]", "Settling time [min]", "Steady-state error [EU]",
                     "IAE [EU·min]", "ISE [EU²·min]", "ITAE [EU·min²]", "Max OP [%]", "Min OP [%]"]
         else:
-            m1 = metrics_disturbance(t1, sp1, pv1, op1, t_step_min=float(t_step), band=0.02)
-            m2 = metrics_disturbance(t2, sp2, pv2, op2, t_step_min=float(t_step), band=0.02)
+            m1 = metrics_disturbance(t1, sp1, pv1, op1, t_step_min=float(st.session_state.tst_t_step), band=0.02)
+            m2 = metrics_disturbance(t2, sp2, pv2, op2, t_step_min=float(st.session_state.tst_t_step), band=0.02)
             keys = ["Max deviation [EU]", "Recovery time [min]",
                     "IAE [EU·min]", "ISE [EU²·min]", "ITAE [EU·min²]", "Max OP [%]", "Min OP [%]"]
 
-        rows = []
-        for k in keys:
-            nd = 2 if ("OP" in k or "Overshoot" in k) else 3
-            rows.append([k, fmt(m1.get(k), nd), fmt(m2.get(k), nd)])
+        st.session_state.last_sim = dict(t1=t1, sp1=sp1, pv1=pv1, op1=op1,
+                                         t2=t2, sp2=sp2, pv2=pv2, op2=op2,
+                                         op_min=op_min, op_max=op_max, mode=mode)
+        st.session_state.last_metrics = dict(m1=m1, m2=m2, keys=keys)
+        st.rerun()
 
-        st.subheader("Kennzahlen (Vorher vs. Nachher)")
-        st.table({"Kennzahl": [r[0] for r in rows],
-                  "Vorher":   [r[1] for r in rows],
-                  "Nachher":  [r[2] for r in rows]})
-        st.subheader("Auswertung & konkrete Vorschläge (für Nachher)")
+# =========================================================
+# Render last results if present
+# =========================================================
+last = st.session_state.get("last_sim")
+lm = st.session_state.get("last_metrics")
 
-after_params = dict(
-    eq=st.session_state.after["eq"],
-    reverse=st.session_state.after["reverse"],
-    Kc=st.session_state.after["Kc"],
-    Ti=st.session_state.after["Ti"],
-    Td=st.session_state.after["Td"],
-    d_filter=st.session_state.after["d_filter"],
-)
+if last is not None and lm is not None:
+    pcol1, pcol2 = st.columns([1, 1], gap="large")
+    with pcol1:
+        st.subheader("Trend: Vorher")
+        fig1 = plot_trends(last["t1"], last["sp1"], last["pv1"], last["op1"], "PID Regler vorher", last["op_min"], last["op_max"])
+        st.pyplot(fig1, clear_figure=True, use_container_width=True)
+        plt.close(fig1)
+    with pcol2:
+        st.subheader("Trend: Nachher")
+        fig2 = plot_trends(last["t2"], last["sp2"], last["pv2"], last["op2"], "PID Regler nachher", last["op_min"], last["op_max"])
+        st.pyplot(fig2, clear_figure=True, use_container_width=True)
+        plt.close(fig2)
 
-rec_lines, suggested = suggest_pid_changes(
-    model_type=model_type,
-    tau=float(tau),
-    dead=float(dead),
-    after_params=after_params,
-    m_after=m2  # "Nachher"-Kennzahlen
-)
+    rows = []
+    for k in lm["keys"]:
+        nd = 2 if ("OP" in k or "Overshoot" in k) else 3
+        rows.append([k, fmt(lm["m1"].get(k), nd), fmt(lm["m2"].get(k), nd)])
 
-st.markdown("\n".join(rec_lines))
-
-apply_col1, apply_col2 = st.columns([1, 2])
-with apply_col1:
-    if st.button("Vorschlag übernehmen (Nachher)"):
-        st.session_state.after["Kc"] = float(suggested["Kc"])
-        st.session_state.after["Ti"] = float(suggested["Ti"])
-        st.session_state.after["Td"] = float(suggested["Td"])
-        st.session_state.after["eq"] = str(suggested["eq"])
-        st.session_state.after["d_filter"] = float(suggested["d_filter"])
-        st.success("Vorschlag übernommen. Bitte nochmal Simulieren.")
-with apply_col2:
-    st.caption(
-        f"Vorschlag: EQ={suggested['eq']}, Kc={suggested['Kc']:.4f}, Ti={suggested['Ti']:.3f} min, "
-        f"Td={suggested['Td']:.3f} min, D-Filter={suggested['d_filter']:.3f} min"
-    )
+    st.subheader("Kennzahlen (Vorher vs. Nachher)")
+    st.table({"Kennzahl": [r[0] for r in rows],
+              "Vorher":   [r[1] for r in rows],
+              "Nachher":  [r[2] for r in rows]})
 else:
     st.info("Links in der Sidebar **IMC berechnen** oder **Simulieren** drücken.")
